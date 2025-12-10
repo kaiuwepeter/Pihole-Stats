@@ -1,4 +1,7 @@
-# Pi-hole Statistics Monitor
+# Pi-hole Statistics Monitor  
+
+<img width="491" height="438" alt="image" src="https://github.com/user-attachments/assets/0479178f-7935-466e-9d43-11f74c754a60" />
+
 
 [English Version / Englische Version](README.md)
 
