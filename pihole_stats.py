@@ -2,6 +2,7 @@
 """
 Pi-hole Statistics Fetcher
 Ruft Statistiken vom Pi-hole Dashboard ab und schreibt sie in eine Textdatei
+Pi-hole api docs: http://pi-hole-ip:port/api/docs/
 """
 
 import requests
@@ -48,11 +49,14 @@ def get_pihole_stats():
             login_data_response = login_response.json()
             print(f"Login Antwort: {json.dumps(login_data_response, indent=2)[:300]}")
 
-            # SID extrahieren falls vorhanden
+            # SID und CSRF extrahieren falls vorhanden
             sid = login_data_response.get('session', {}).get('sid')
+            csrf = login_data_response.get('session', {}).get('csrf')
             if sid:
                 print(f"Session ID: {sid[:20]}...")
                 session.headers.update({"X-FTL-SID": sid})
+                if csrf:
+                    session.headers.update({"X-FTL-CSRF": csrf})
         else:
             print(f"Login Antwort: {login_response.text[:300]}")
     except Exception as e:
@@ -71,11 +75,11 @@ def get_pihole_stats():
 
         if response.status_code == 200:
             all_data['summary'] = response.json()
-            print(f"✓ Summary erfolgreich abgerufen")
+            print(f"[OK] Summary erfolgreich abgerufen")
         else:
-            print(f"✗ Summary Fehler: {response.status_code}")
+            print(f"[FEHLER] Summary Fehler: {response.status_code}")
     except Exception as e:
-        print(f"✗ Summary Fehler: {e}")
+        print(f"[FEHLER] Summary Fehler: {e}")
 
     # 2. Top Clients abrufen
     print("Rufe Top Clients ab...")
@@ -85,34 +89,53 @@ def get_pihole_stats():
 
         if response.status_code == 200:
             all_data['top_clients'] = response.json()
-            print(f"✓ Top Clients erfolgreich abgerufen")
+            print(f"[OK] Top Clients erfolgreich abgerufen")
         else:
-            print(f"✗ Top Clients Fehler: {response.status_code}")
+            print(f"[FEHLER] Top Clients Fehler: {response.status_code}")
     except Exception as e:
-        print(f"✗ Top Clients Fehler: {e}")
+        print(f"[FEHLER] Top Clients Fehler: {e}")
 
     # 3. Client-Informationen (mit Namen) abrufen
     print("Rufe Client-Informationen ab...")
-    client_endpoints = [
-        "/api/clients",
-        "/api/network/clients",
-        "/api/dns/clients"
-    ]
+    try:
+        url = f"{PIHOLE_URL}/api/clients"
+        response = session.get(url, timeout=10)
 
-    for endpoint in client_endpoints:
-        try:
-            url = f"{PIHOLE_URL}{endpoint}"
-            response = session.get(url, timeout=10)
+        if response.status_code == 200:
+            all_data['clients_info'] = response.json()
+            print(f"[OK] Client-Informationen abgerufen")
+        else:
+            print(f"[FEHLER] Clients Info: {response.status_code}")
+    except Exception as e:
+        print(f"[FEHLER] Clients Info: {e}")
 
-            if response.status_code == 200:
-                all_data['clients_info'] = response.json()
-                print(f"✓ Client-Informationen von {endpoint} abgerufen")
-                print(f"  Datenstruktur: {json.dumps(response.json(), indent=2)[:500]}")
-                break
-            else:
-                print(f"  {endpoint}: Status {response.status_code}")
-        except Exception as e:
-            print(f"  {endpoint}: Fehler - {e}")
+    # 3b. Netzwerk-Geräte (MAC zu IP Mapping) abrufen
+    print("Rufe Netzwerk-Geräte ab...")
+    try:
+        url = f"{PIHOLE_URL}/api/network/devices"
+        response = session.get(url, timeout=10)
+
+        if response.status_code == 200:
+            all_data['network_devices'] = response.json()
+            print(f"[OK] Netzwerk-Geräte abgerufen")
+        else:
+            print(f"[FEHLER] Netzwerk-Geräte: {response.status_code}")
+    except Exception as e:
+        print(f"[FEHLER] Netzwerk-Geräte: {e}")
+
+    # 4. Top Blocked Clients abrufen
+    print("Rufe Top Blocked Clients ab...")
+    try:
+        url = f"{PIHOLE_URL}/api/stats/top_clients"
+        response = session.get(url, params={"blocked": "true"}, timeout=10)
+
+        if response.status_code == 200:
+            all_data['top_blocked_clients'] = response.json()
+            print(f"[OK] Top Blocked Clients abgerufen")
+        else:
+            print(f"[FEHLER] Top Blocked Clients: {response.status_code}")
+    except Exception as e:
+        print(f"[FEHLER] Top Blocked Clients: {e}")
 
     print()
 
@@ -143,61 +166,90 @@ def send_discord_webhook(stats):
         # Top Clients verarbeiten
         top_clients_data = stats.get('top_clients', {})
         clients_info_data = stats.get('clients_info', {})
+        network_devices_data = stats.get('network_devices', {})
+        top_blocked_clients_data = stats.get('top_blocked_clients', {})
 
-        # Client-Namen Mapping erstellen
-        client_names_map = {}
+        # Client-Namen und Blockierungs-Mapping erstellen
+        client_names_map = {}  # IP -> Name
+        mac_to_name_map = {}   # MAC -> Name
+        mac_to_ip_map = {}     # MAC -> IP
+        client_blocked_map = {}
+
+        # 1. MAC zu Name Mapping aus clients_info erstellen
         if clients_info_data:
-            # Versuche verschiedene Strukturen
-            clients_list = (
-                clients_info_data.get('clients', []) or
-                clients_info_data.get('data', []) or
-                []
-            )
+            clients_list = clients_info_data.get('clients', [])
 
-            # Falls es ein Dict ist, versuche es zu konvertieren
-            if isinstance(clients_list, dict):
-                temp_list = []
-                for key, value in clients_list.items():
-                    if isinstance(value, dict):
-                        value['id'] = key
-                        temp_list.append(value)
-                clients_list = temp_list
-
-            # Erstelle Mapping von IP/MAC zu Name
             for client in clients_list:
                 if isinstance(client, dict):
-                    # 'client' kann IP oder MAC sein
-                    client_id = client.get('client', '')
+                    client_id = client.get('client', '').lower()  # MAC oder IP
                     comment = client.get('comment', '')
-
-                    # Name aus verschiedenen Feldern (comment hat Priorität)
                     name = comment or client.get('name', '') or client.get('hostname', '')
 
                     if client_id and name:
-                        client_names_map[client_id] = name
+                        # Prüfe ob es eine IP ist (enthält Punkte)
+                        if '.' in client_id:
+                            client_names_map[client_id] = name
+                        # Sonst ist es eine MAC-Adresse (enthält Doppelpunkte)
+                        elif ':' in client_id:
+                            mac_to_name_map[client_id] = name
 
-                    # Auch alternative Felder versuchen
-                    ip = client.get('ip', '')
-                    mac = client.get('mac', '')
-                    if ip and name:
+        # 2. MAC zu IP Mapping aus network_devices erstellen
+        if network_devices_data:
+            devices = network_devices_data.get('devices', [])
+
+            for device in devices:
+                if isinstance(device, dict):
+                    mac = device.get('hwaddr', '').lower()
+                    ips = device.get('ips', [])
+
+                    # Für jede IP die zu dieser MAC gehört
+                    for ip_data in ips:
+                        if isinstance(ip_data, dict):
+                            ip = ip_data.get('ip', '')
+                            if mac and ip:
+                                mac_to_ip_map[mac] = ip
+
+        # 3. IP zu Name Mapping erstellen (MAC -> Name + MAC -> IP = IP -> Name)
+        for mac, name in mac_to_name_map.items():
+            if mac in mac_to_ip_map:
+                ip = mac_to_ip_map[mac]
+                client_names_map[ip] = name
+
+        # Blockierungs-Daten aus top_blocked_clients extrahieren
+        if top_blocked_clients_data:
+            blocked_clients = top_blocked_clients_data.get('clients', [])
+
+            for blocked_client in blocked_clients:
+                if isinstance(blocked_client, dict):
+                    ip = blocked_client.get('ip', '')
+                    blocked_count = blocked_client.get('count', 0)
+                    name = blocked_client.get('name', '')
+
+                    if ip:
+                        client_blocked_map[ip] = blocked_count
+
+                    # Namen hinzufügen falls vorhanden
+                    if name and ip and ip not in client_names_map:
                         client_names_map[ip] = name
-                    if mac and name:
-                        client_names_map[mac] = name
 
         # Top Clients extrahieren
         top_clients = top_clients_data.get('clients', [])
 
-        # Namen zu Top Clients hinzufügen
+        # Namen und Blockierungen zu Top Clients hinzufügen
         for client in top_clients:
             if isinstance(client, dict):
                 ip = client.get('ip', '')
-                # Verwende den Namen aus dem Mapping, falls vorhanden
+
+                # Namen setzen
                 if ip in client_names_map:
                     client['display_name'] = client_names_map[ip]
                 elif client.get('name'):
                     client['display_name'] = client['name']
                 else:
                     client['display_name'] = ip
+
+                # Blockierte Queries setzen
+                client['blocked'] = client_blocked_map.get(ip, 0)
 
         # Percentage berechnen
         if total_queries > 0:
@@ -225,13 +277,17 @@ def send_discord_webhook(stats):
             for i, client in enumerate(top_clients[:4], 1):
                 client_name = client.get('display_name', client.get('ip', 'Unknown'))
                 client_queries = client.get('count', 0)
+                client_blocked = client.get('blocked', 0)
                 client_ip = client.get('ip', '')
 
                 # Wenn Name und IP unterschiedlich sind, zeige beides
                 if client_name != client_ip and client_ip:
-                    top_clients_text += f"{i}. **{client_name}** ({client_ip}) - {format_number(client_queries)} queries\n"
+                    top_clients_text += f"{i}. **{client_name}** ({client_ip})\n"
                 else:
-                    top_clients_text += f"{i}. **{client_name}** - {format_number(client_queries)} queries\n"
+                    top_clients_text += f"{i}. **{client_name}**\n"
+
+                # Queries und Blockierungen anzeigen
+                top_clients_text += f"   └ {format_number(client_queries)} queries | {format_number(client_blocked)} blocked\n"
         else:
             top_clients_text = "Keine Client-Daten verfügbar"
 
@@ -303,15 +359,15 @@ def send_discord_webhook(stats):
         )
 
         if response.status_code == 204:
-            print("✅ Discord Webhook erfolgreich gesendet!")
+            print("[OK] Discord Webhook erfolgreich gesendet!")
             return True
         else:
-            print(f"❌ Discord Webhook Fehler: Status Code {response.status_code}")
+            print(f"[FEHLER] Discord Webhook Fehler: Status Code {response.status_code}")
             print(f"Antwort: {response.text}")
             return False
 
     except Exception as e:
-        print(f"❌ Fehler beim Senden des Discord Webhooks: {e}")
+        print(f"[FEHLER] Fehler beim Senden des Discord Webhooks: {e}")
         import traceback
         traceback.print_exc()
         return False
